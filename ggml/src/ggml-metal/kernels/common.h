@@ -68,6 +68,17 @@ static inline float e8m0_to_fp32(uint8_t x) {
     return as_type<float>(bits);
 }
 
+// NVFP4 sub-block scale: unsigned E4M3 (bias 7), 0x00 and 0x7F decode to 0 as in ggml_ue4m3_to_fp32()
+// returns 2x the CPU value because kvalues_mxfp4_f holds the real E2M1 values (the CPU table is doubled)
+static inline float ue4m3_to_fp32(uint8_t x) {
+    const uint32_t e = (x >> 3) & 0xF;
+    const uint32_t m = x & 0x7;
+
+    const float r = e == 0 ? (float) m * (1.0f/512.0f) : as_type<float>(((e + 120) << 23) | (m << 20));
+
+    return x == 0x7F ? 0.0f : r;
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }

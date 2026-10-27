@@ -378,6 +378,49 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
     reg[3] = d * kvalues_mxfp4_f[(q2[4*il4 + 3] >> shr) & 0x0F];
 }
 
+// block_nvfp4: 64 values in 4 sub-blocks of 16, one UE4M3 scale per sub-block
+// within a sub-block, byte j holds value j (low nibble) and value j + 8 (high nibble)
+// nl = 4: il selects the sub-block, 16 values per call
+template <typename type4x4>
+void dequantize_nvfp4(device const block_nvfp4 * xb, short il, thread type4x4 & reg) {
+    device const uint8_t * qs = xb->qs + il*(QK_NVFP4_SUB/2);
+
+    const float d = ue4m3_to_fp32(xb->d[il]);
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 2; ++i) {
+        reg_f[i + 0][0] = d * kvalues_mxfp4_f[qs[4*i + 0] & 0x0F];
+        reg_f[i + 0][1] = d * kvalues_mxfp4_f[qs[4*i + 1] & 0x0F];
+        reg_f[i + 0][2] = d * kvalues_mxfp4_f[qs[4*i + 2] & 0x0F];
+        reg_f[i + 0][3] = d * kvalues_mxfp4_f[qs[4*i + 3] & 0x0F];
+
+        reg_f[i + 2][0] = d * kvalues_mxfp4_f[qs[4*i + 0] >> 4];
+        reg_f[i + 2][1] = d * kvalues_mxfp4_f[qs[4*i + 1] >> 4];
+        reg_f[i + 2][2] = d * kvalues_mxfp4_f[qs[4*i + 2] >> 4];
+        reg_f[i + 2][3] = d * kvalues_mxfp4_f[qs[4*i + 3] >> 4];
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+// 16 chunks of 4 values per block, in element order
+template <typename type4>
+void dequantize_nvfp4_t4(device const block_nvfp4 * xb, short il, thread type4 & reg) {
+    const short sub = il/4;
+    const short rem = il%4;
+
+    device const uint8_t * qs = xb->qs + sub*(QK_NVFP4_SUB/2) + (rem%2)*4;
+
+    const float   d   = ue4m3_to_fp32(xb->d[sub]);
+    const uint8_t shr = rem >= 2 ? 4 : 0;
+
+    reg[0] = d * kvalues_mxfp4_f[(qs[0] >> shr) & 0x0F];
+    reg[1] = d * kvalues_mxfp4_f[(qs[1] >> shr) & 0x0F];
+    reg[2] = d * kvalues_mxfp4_f[(qs[2] >> shr) & 0x0F];
+    reg[3] = d * kvalues_mxfp4_f[(qs[3] >> shr) & 0x0F];
+}
+
 template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
