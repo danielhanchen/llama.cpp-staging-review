@@ -1,0 +1,93 @@
+name: i15409 metal nvfp4
+on:
+  push:
+    branches: [probe/i15409-metal-nvfp4]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  metal:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      GGML_METAL_FORCE_SIMDGROUP: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: probe, fetch-depth: 3}
+      - name: Source (base = HEAD~2 upstream tag, head = HEAD~1 fix; CI-only simdgroup override in both)
+        run: |
+          set -eux
+          git -C probe log --oneline -3
+          git -C probe worktree add ../base HEAD~2
+          git -C probe worktree add ../head HEAD~1
+          for d in base head; do
+            python3 probe/ci/force_simdgroup.py $d/ggml/src/ggml-metal/ggml-metal-device.m
+          done
+          git -C head diff --stat HEAD~1 -- ggml/src/ggml-metal | tail -1
+          sysctl -n hw.memsize hw.ncpu machdep.cpu.brand_string; sw_vers
+      - name: Build
+        run: |
+          set -eux
+          for d in base head; do
+            cmake -S $d -B $d/build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+              -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF > /dev/null
+            cmake --build $d/build -j 4 --target test-backend-ops llama-bench llama-completion llama-perplexity llama-quantize 2>&1 | tail -2
+          done
+      - name: test-backend-ops (nvfp4 on MTL0, base vs head)
+        run: |
+          set +e
+          mkdir -p out
+          for d in base head; do
+            for spec in MUL_MAT:nvfp4 MUL_MAT_ID:nvfp4 GET_ROWS:nvfp4 MUL_MAT:mxfp4 MUL_MAT_ID:mxfp4 GET_ROWS:mxfp4; do
+              op=${spec%%:*}; pat=${spec#*:}
+              log=out/tbo_${d}_${op}_${pat}.log
+              perl -e 'alarm shift; exec @ARGV' 1500 $d/build/bin/test-backend-ops test -b MTL0 -o $op -p $pat > $log 2>&1; rc=$?
+              echo "RESULT tbo arm=$d op=$op pat=$pat rc=$rc ok=$(grep -c ': OK' $log || true) fail=$(grep -c 'FAIL' $log || true) not_supported=$(grep -c 'not supported' $log || true) passed_line='$(grep -E 'backends passed|tests passed' $log | tail -1)'"
+            done
+          done
+          grep -h -E 'GPU name|GPU family|simdgroup|recommendedMax' out/tbo_head_MUL_MAT_nvfp4.log | head -8
+          grep -h 'FAIL' out/tbo_head_*nvfp4*.log | head -20
+      - name: Tiny NVFP4 MoE (random-weight Qwen3-MoE, real tokenizer, Q8_0 + NVFP4 routed experts)
+        run: |
+          set -eux
+          python3 -m venv venv
+          venv/bin/pip -q install --extra-index-url https://download.pytorch.org/whl/cpu torch transformers==4.57.6 safetensors sentencepiece numpy protobuf
+          venv/bin/pip -q install ./head/gguf-py
+          venv/bin/python probe/ci/make_tiny_moe.py hf_tiny
+          venv/bin/python head/convert_hf_to_gguf.py hf_tiny --outtype bf16 --outfile tiny-bf16.gguf 2>&1 | tail -2
+          rm -rf hf_tiny
+          head/build/bin/llama-quantize --tensor-type exps=nvfp4 tiny-bf16.gguf tiny-nvfp4.gguf Q8_0 4 2>&1 | grep -c 'q8_0 -> nvfp4'
+          rm -f tiny-bf16.gguf
+          ls -la tiny-nvfp4.gguf
+      - name: Placement + generation (base vs head)
+        run: |
+          set +e
+          for d in base head; do
+            perl -e 'alarm shift; exec @ARGV' 900 $d/build/bin/llama-completion -m tiny-nvfp4.gguf -ngl 99 -n 64 -p "The capital of France is" -no-cnv --temp 0 -s 1 -c 512 > out/gen_$d.log 2>&1
+            echo "== $d rc=$?"
+            grep -E 'offloaded|model buffer size|type nvfp4|eval time' out/gen_$d.log
+          done
+      - name: llama-bench tok/s (base vs head, interleaved, 2 rounds x 3 reps)
+        run: |
+          set +e
+          for r in 1 2; do for d in base head; do
+            echo "== bench $d round $r"
+            perl -e 'alarm shift; exec @ARGV' 1200 $d/build/bin/llama-bench -m tiny-nvfp4.gguf -ngl 99 -p 128 -n 64 -r 3 -o md 2>&1 | tee out/bench_${d}_r$r.log | grep -E '^\|'
+          done; done
+      - name: KLD head vs base (base runs the NVFP4 experts on the CPU = reference)
+        run: |
+          set +e
+          for i in $(seq 1 40); do cat head/README.md; done > text.txt
+          perl -e 'alarm shift; exec @ARGV' 1500 base/build/bin/llama-perplexity -m tiny-nvfp4.gguf -ngl 99 -f text.txt -c 256 --chunks 16 --kl-divergence-base kld_base.bin > out/ppl_base.log 2>&1; echo "base rc=$?"
+          perl -e 'alarm shift; exec @ARGV' 1500 head/build/bin/llama-perplexity -m tiny-nvfp4.gguf -ngl 99 -f text.txt -c 256 --chunks 16 --kl-divergence-base kld_base.bin --kl-divergence > out/ppl_head.log 2>&1; echo "head rc=$?"
+          grep -E 'Final estimate|PPL' out/ppl_base.log | tail -2
+          grep -E -A40 'KL divergence statistics|====== Perplexity' out/ppl_head.log | grep -E 'Mean PPL|Mean    KLD|Maximum KLD|Same top|99.0%|Median  KLD' | head -10
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: out-${{ matrix.os }}
+          path: out
